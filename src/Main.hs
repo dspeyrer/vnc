@@ -1,14 +1,59 @@
 module Main where
 
 import Control.Monad
+import Control.Monad.IO.Class
 import DES
 import Data.ByteString as BS
+import Data.ByteString.Lazy as BL
 import Data.Binary
+import Data.Binary.Get
+import Data.Binary.Put
 import Data.String
 import Network.Socket
-import Network.Socket.ByteString as NS
-import Network.Socket.ByteString.Lazy as NL
+import Network.Socket.ByteString.Lazy as N
 import System.Random
+
+data Client = Client
+    { clientSocket :: Socket
+    , clientStream :: LazyByteString
+    }
+
+newtype Proto a = Proto { runProto :: Client -> IO (Maybe a, Client) }
+
+instance Functor Proto where
+    fmap = (<*>) . pure
+
+instance Applicative Proto where
+    mf <*> mx = mf >>= \f -> mx >>= \x -> return $ f x
+    pure x = Proto $ pure . (pure x,)
+
+instance Monad Proto where
+    m1 >>= m2 = Proto $ \c -> runProto m1 c >>= b'
+        where b' ( Just x, c') = runProto (m2 x) c'
+              b' (Nothing, c') = return (Nothing, c')
+
+instance MonadIO Proto where
+    liftIO m = Proto $ \c -> m >>= \x -> return (return x, c)
+
+class Liftable m where
+    lift :: m a -> Proto a
+
+instance Liftable IO where
+    lift = liftIO 
+
+instance Liftable Get where
+    lift m = Proto $ \c ->
+        return $ case runGetOrFail m (clientStream c) of
+            Left _ ->
+                (Nothing, c)
+            Right (rest, _, x) ->
+                (Just x, c { clientStream = rest })
+
+instance Liftable PutM where
+    lift m = Proto $ \c -> do
+            sendAll (clientSocket c) d
+            return (Just x, c)
+        where (x, d) = runPutM m
 
 main :: IO ()
 main = do
@@ -17,25 +62,27 @@ main = do
     bind server $ SockAddrInet 5900 $ tupleToHostAddress (127, 0, 0, 1)
     listen server 1024
     putStrLn "Listening..."
-    forever $ accept server >>= \(client, _) -> handleClient client *> close client
+    forever $ accept server >>= \(sock, _) -> do
+        stream <- N.getContents sock
+        _ <- runProto handleClient $ Client sock stream
+        close sock
 
-handleClient :: Socket -> IO ()
-handleClient s = do
-    putStrLn "Accepted connection"
-    protoVersion s
+
+handleClient :: Proto ()
+handleClient = protoVersion
 
 -- ProtocolVersion ---------------------
 
 versionMsg :: StrictByteString
 versionMsg = fromString "RFB 003.003\n"
 
-protoVersion :: Socket -> IO ()
-protoVersion s = do
-    NS.sendAll s versionMsg
-    resVerMsg <- readExact s 12
-    (if versionMsg == resVerMsg
+protoVersion :: Proto ()
+protoVersion = do
+    lift $ putByteString versionMsg
+    resVerMsg <- lift $ getByteString 12
+    if versionMsg == resVerMsg
        then protoVncAuth
-       else protoVerFail) s
+       else protoVerFail
 
 unsupportedVersionMsg :: StrictByteString
 unsupportedVersionMsg = fromString "Unsupported client version!"
@@ -50,15 +97,15 @@ secTyInvalid = 0
 secTyNone    = 1
 secTyVncAuth = 2
 
-protoVerFail :: Socket -> IO ()
-protoVerFail s = do
-    write secTyInvalid s
-    NS.sendAll s unsupportedVersionMsg
+protoVerFail :: Proto ()
+protoVerFail = do
+    lift $ put secTyInvalid
+    lift $ put unsupportedVersionMsg
 
-protoAuthNone :: Socket -> IO ()
-protoAuthNone s = do
-    write secTyNone s
-    protoClientInit s
+protoAuthNone :: Proto ()
+protoAuthNone = do
+    lift $ put secTyNone
+    protoClientInit
 
 password :: Word64
 password = decode $ fromString "password"
@@ -70,15 +117,15 @@ solveChallenge x =
         $ BS.splitAt 8 x
     where both f (a, b) = (f a, f b)
 
-protoVncAuth :: Socket -> IO ()
-protoVncAuth s = do
-    write secTyVncAuth s
+protoVncAuth :: Proto ()
+protoVncAuth = do
+    lift $ put secTyVncAuth
     challenge <- getStdRandom (uniformByteString 16)
-    NS.sendAll s challenge
-    res <- readExact s 16
-    (if res == solveChallenge challenge
+    lift $ putByteString challenge
+    res <- lift $ getByteString 16
+    if res == solveChallenge challenge
         then protoSecResOk
-        else protoSecResFail) s
+        else protoSecResFail
 
 -- SecurityResult ----------------------
 
@@ -88,33 +135,18 @@ secResFail :: Word32
 secResOk   = 0
 secResFail = 1
 
-protoSecResFail :: Socket -> IO ()
-protoSecResFail s = do
-    write secResFail s
+protoSecResFail :: Proto ()
+protoSecResFail = do
+    lift $ put secResFail
 
-protoSecResOk :: Socket -> IO ()
-protoSecResOk s = do
-    write secResOk s
-    protoClientInit s
+protoSecResOk :: Proto ()
+protoSecResOk = do
+    lift $ put secResOk
+    protoClientInit
 
 -- ClientInit -----------------------
 
-protoClientInit :: Socket -> IO ()
-protoClientInit s = do
+protoClientInit :: Proto ()
+protoClientInit = do
     -- TODO
     return ()
-
--- Rest -----------------------------
-
-write :: Binary a => a -> Socket -> IO ()
-write x s = NL.sendAll s $ encode x
-
-readExact :: Socket -> Int -> IO StrictByteString
-readExact _ 0 = return BS.empty
-readExact stream n = do
-    h <- NS.recv stream n
-    if BS.null h then
-        error "unexpected EOF"
-    else
-        readExact stream (n - BS.length h)
-            >>= (\t -> return $ BS.append h t)
