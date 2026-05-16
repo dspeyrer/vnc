@@ -11,7 +11,6 @@ executable vnc
     hs-source-dirs:   src
     other-modules:
         DES
-        -- DES2
 
     default-language: GHC2021
     ghc-options:      -Wall
