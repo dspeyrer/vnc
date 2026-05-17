@@ -11,6 +11,7 @@ import Data.Binary
 import Data.Binary.Get
 import Data.Binary.Put
 import Data.Bool
+import Data.Functor
 import Data.Maybe
 import Data.String
 import Network.Socket
@@ -252,33 +253,32 @@ defaultPixelFormat :: PixelFormat
 defaultPixelFormat = PixelFormat 32 24 True True 255 255 255 16 8 0
 
 putPixelFormat :: PixelFormat -> Put
-putPixelFormat (PixelFormat bpp depth bigEndian trueColour redMax greenMax blueMax redShift greenShift blueShift) = do
-    putWord8    $ bpp
-    putWord8    $ depth
-    putBool     $ bigEndian
-    putBool     $ trueColour
-    putWord16be $ redMax
-    putWord16be $ greenMax
-    putWord16be $ blueMax
-    putWord8    $ redShift
-    putWord8    $ greenShift
-    putWord8    $ blueShift
+putPixelFormat f = do
+    putWord8    $ bpp        f
+    putWord8    $ depth      f
+    putBool     $ bigEndian  f
+    putBool     $ trueColour f
+    putWord16be $ redMax     f
+    putWord16be $ greenMax   f
+    putWord16be $ blueMax    f
+    putWord8    $ redShift   f
+    putWord8    $ greenShift f
+    putWord8    $ blueShift  f
     putZeroes   3
 
 getPixelFormat :: Get PixelFormat
-getPixelFormat = do
-    bpp        <- getWord8
-    depth      <- getWord8
-    bigEndian  <- getBool
-    trueColour <- getBool
-    redMax     <- getWord16be
-    greenMax   <- getWord16be
-    blueMax    <- getWord16be
-    redShift   <- getWord8
-    greenShift <- getWord8
-    blueShift  <- getWord8
-    skip          3
-    return $ PixelFormat bpp depth bigEndian trueColour redMax greenMax blueMax redShift greenShift blueShift
+getPixelFormat = PixelFormat
+    <$> getWord8
+    <*> getWord8
+    <*> getBool
+    <*> getBool
+    <*> getWord16be
+    <*> getWord16be
+    <*> getWord16be
+    <*> getWord8
+    <*> getWord8
+    <*> getWord8
+    <* skip 3
 
 data KnownEncoding = Zlib | ZRLE | DesktopSize | Cursor deriving (Show)
 
@@ -316,30 +316,34 @@ data ClientMessage
 getClientMessage :: Get ClientMessage
 getClientMessage = getWord8 >>= \ty ->
     case ty of
-        0 -> skip 3 >> SetPixelFormat <$> getPixelFormat
-        2 -> skip 1 >> do
-            n <- getWord16be
-            SetEncodings . catMaybes <$> replicateM (fromIntegral n) getKnownEncoding
-        3 -> do
-            i <- getBool
-            x <- getWord16be
-            y <- getWord16be
-            w <- getWord16be
-            h <- getWord16be
-            return $ FramebufferUpdateRequest i x y w h
-        4 -> do
-            down <- getBool
-            skip 2
-            key <- getWord32be
-            return $ KeyEvent down key
-        5 -> do
-            btnMask <- getWord8
-            x <- getWord16be
-            y <- getWord16be
-            return $ PointerEvent btnMask x y
-        6 -> skip 3 >> do
-            n <- getWord32be
-            ClientCutText <$> (getByteString $ fromIntegral n)
+        0 -> SetPixelFormat
+            <$  skip 3
+            <*> getPixelFormat
+        2 -> SetEncodings
+            <$  skip 1
+            <*> (fromIntegral
+                <$> getWord16be
+                >>= flip replicateM getKnownEncoding
+                <&> catMaybes)
+        3 -> FramebufferUpdateRequest
+            <$> getBool
+            <*> getWord16be
+            <*> getWord16be
+            <*> getWord16be
+            <*> getWord16be
+        4 -> KeyEvent
+            <$> getBool
+            <*  skip 2
+            <*> getWord32be
+        5 -> PointerEvent
+            <$> getWord8
+            <*> getWord16be
+            <*> getWord16be
+        6 -> ClientCutText
+            <$  skip 3
+            <*> (fromIntegral
+                <$> getWord32be
+                >>= getByteString)
         _ -> fail "unknown message type"
 
 -- FramebufferUpdate
