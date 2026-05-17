@@ -1,5 +1,6 @@
 module Main where
 
+import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
 import DES
@@ -67,17 +68,19 @@ main = do
     bind server $ SockAddrInet 5900 $ tupleToHostAddress (127, 0, 0, 1)
     listen server 1024
     putStrLn "Listening..."
-    forever $ accept server >>= \(sock, _) -> do
-        putStrLn "Connected"
-        stream <- N.getContents sock
-        (result, _) <- runProto handleClient $ Client sock stream
-        putStrLn $ case result of
-            Left err -> "Connection closed (" ++ err ++ ")"
-            _ -> "Disconnected"
-        close sock
+    forever $ do
+        msg <- handle
+            (return . displayException :: SomeException -> IO String)
+            $ bracket (accept server) (close . fst) $ \(sock, addr) -> do
+                putStrLn $ "Connected to " ++ show addr
+                stream <- N.getContents sock
+                (result, _) <- runProto handleClient $ Client sock stream
+                close sock
+                return $ either id id result
+        putStrLn $ "Disconnected -- " ++ msg
 
 
-handleClient :: Proto ()
+handleClient :: Proto a
 handleClient = protoVersion
 
 -- ProtocolVersion ---------------------
@@ -85,7 +88,7 @@ handleClient = protoVersion
 versionMsg :: StrictByteString
 versionMsg = fromString "RFB 003.003\n"
 
-protoVersion :: Proto ()
+protoVersion :: Proto a
 protoVersion = do
     lift $ putByteString versionMsg
     resVerMsg <- lift $ getByteString 12
@@ -106,10 +109,11 @@ secTyInvalid = 0
 secTyNone    = 1
 secTyVncAuth = 2
 
-protoVerFail :: Proto ()
+protoVerFail :: Proto a
 protoVerFail = do
     lift $ put secTyInvalid
     lift $ put unsupportedVersionMsg
+    fail "unsupported client version"
 
 protoAuthNone :: Proto ()
 protoAuthNone = do
@@ -126,7 +130,7 @@ solveChallenge x =
         $ BS.splitAt 8 x
     where both f (a, b) = (f a, f b)
 
-protoVncAuth :: Proto ()
+protoVncAuth :: Proto a
 protoVncAuth = do
     lift $ put secTyVncAuth
     challenge <- getStdRandom (uniformByteString 16)
@@ -144,45 +148,82 @@ secResFail :: Word32
 secResOk   = 0
 secResFail = 1
 
-protoSecResFail :: Proto ()
+protoSecResFail :: Proto a
 protoSecResFail = do
     lift $ put secResFail
+    fail "authentication failure"
 
-protoSecResOk :: Proto ()
+protoSecResOk :: Proto a
 protoSecResOk = do
     lift $ put secResOk
     protoClientInit
 
 -- ClientInit -----------------------
 
-protoClientInit :: Proto ()
+protoClientInit :: Proto a
 protoClientInit = do
     _share <- lift $ getBool
     protoServerInit
 
 -- ServerInit -----------------------
 
-putServerInitMsg :: String -> Put
-putServerInitMsg name = do
+putServerInitMsg :: String -> PixelFormat -> Put
+putServerInitMsg name pf = do
     putWord16be 1080 -- framebuffer-width
     putWord16be  720 -- framebuffer-height
-    putPixelFormat $ PixelFormat
-        32 24 True True
-        255 255 255
-         16   8   0
+    putPixelFormat pf
     putWord32be      $
         fromIntegral $
-        length name     -- name-length
-    putStringUtf8 name  -- name-string
+        length name
+    putStringUtf8 name
 
-protoServerInit :: Proto ()
+protoServerInit :: Proto a
 protoServerInit = do
-    lift $ putServerInitMsg "headless"
-    forever $ do
-        msg <- lift $ getClientMessage
-        lift $ putStrLn $ "Got message: " ++ show msg
+    lift $ putServerInitMsg "headless" $ pixelFormat state
+    protoLoop state
+    where state = ServerState defaultPixelFormat
 
 -- Main Loop ------------------------
+
+type Pixel = (Word16, Word16, Word16)
+type Framebuffer = [[Pixel]]
+
+getFramebuffer :: Framebuffer
+getFramebuffer = error "todo"
+
+encodePixel :: PixelFormat -> Pixel -> Put
+encodePixel format = error "todo"
+
+encodePixels :: PixelFormat -> Framebuffer -> Put
+encodePixels format = mapM_ $ mapM_ $ encodePixel format
+
+protoLoop :: ServerState -> Proto a
+protoLoop state = lift getClientMessage >>= \msg -> do
+    case msg of
+        SetPixelFormat pixelFormat ->
+            protoLoop state { pixelFormat }
+        FramebufferUpdateRequest _incremental x y w h -> do
+            noise <- getStdRandom (uniformByteString (div ((fromIntegral w) * (fromIntegral h) * (fromIntegral $ bpp $ pixelFormat state)) 8))
+            lift $ do
+                putWord8 0
+                putWord8 0
+                putWord16be 1
+
+                putWord16be x
+                putWord16be y
+                putWord16be w
+                putWord16be h
+                putInt32be 0
+
+                putByteString noise
+            protoLoop state
+        _ -> do
+            lift $ putStrLn $ "Unhandled " ++ show msg
+            protoLoop state
+
+data ServerState = ServerState
+    { pixelFormat :: PixelFormat
+    }
 
 putZeroes :: Int -> Put
 putZeroes n = replicateM_ n $ putWord8 0
@@ -206,6 +247,9 @@ data PixelFormat = PixelFormat
   , blueShift  :: Word8
   }
   deriving (Show)
+
+defaultPixelFormat :: PixelFormat
+defaultPixelFormat = PixelFormat 32 24 True True 255 255 255 16 8 0
 
 putPixelFormat :: PixelFormat -> Put
 putPixelFormat (PixelFormat bpp depth bigEndian trueColour redMax greenMax blueMax redShift greenShift blueShift) = do
@@ -266,7 +310,7 @@ data ClientMessage
         , x :: Word16
         , y :: Word16
         }
-    | ClientCutText String
+    | ClientCutText StrictByteString
     deriving (Show) 
 
 getClientMessage :: Get ClientMessage
@@ -283,9 +327,19 @@ getClientMessage = getWord8 >>= \ty ->
             w <- getWord16be
             h <- getWord16be
             return $ FramebufferUpdateRequest i x y w h
-        4 -> fail "unimplemented KeyEvent"
-        5 -> fail "unimplemented PointerEvent"
-        6 -> fail "unimplemented ClientCutText"
+        4 -> do
+            down <- getBool
+            skip 2
+            key <- getWord32be
+            return $ KeyEvent down key
+        5 -> do
+            btnMask <- getWord8
+            x <- getWord16be
+            y <- getWord16be
+            return $ PointerEvent btnMask x y
+        6 -> skip 3 >> do
+            n <- getWord32be
+            ClientCutText <$> (getByteString $ fromIntegral n)
         _ -> fail "unknown message type"
 
 -- FramebufferUpdate
