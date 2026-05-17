@@ -69,17 +69,22 @@ main = do
     bind server $ SockAddrInet 5900 $ tupleToHostAddress (127, 0, 0, 1)
     listen server 1024
     putStrLn "Listening..."
-    forever $ do
-        msg <- handle
-            (return . displayException :: SomeException -> IO String)
-            $ bracket (accept server) (close . fst) $ \(sock, addr) -> do
-                putStrLn $ "Connected to " ++ show addr
-                stream <- N.getContents sock
-                (result, _) <- runProto handleClient $ Client sock stream
-                close sock
-                return $ either id id result
-        putStrLn $ "Disconnected -- " ++ msg
+    handleClients server
 
+handleClients :: Socket -> IO ()
+handleClients server = do
+    (msg, exception) <- handle
+        (\(e :: SomeException) -> return (displayException e, Just e))
+        $ bracket (accept server) (close . fst) $ \(sock, addr) -> do
+            putStrLn $ "Connected to " ++ show addr
+            stream <- N.getContents sock
+            (result, _) <- runProto handleClient $ Client sock stream
+            close sock
+            return (either id id result, Nothing)
+    putStrLn $ "Disconnected -- " ++ msg
+    if elem UserInterrupt $ exception >>= fromException
+        then return ()
+        else handleClients server
 
 handleClient :: Proto a
 handleClient = protoVersion
@@ -204,7 +209,7 @@ protoLoop state = lift getClientMessage >>= \msg -> do
         SetPixelFormat pixelFormat ->
             protoLoop state { pixelFormat }
         FramebufferUpdateRequest _incremental x y w h -> do
-            noise <- getStdRandom (uniformByteString (div ((fromIntegral w) * (fromIntegral h) * (fromIntegral $ bpp $ pixelFormat state)) 8))
+            noise <- getStdRandom $ uniformByteString $ div (fromIntegral w * fromIntegral h * (fromIntegral $ bpp $ pixelFormat state)) 8
             lift $ do
                 putWord8 0
                 putWord8 0
@@ -321,8 +326,8 @@ getClientMessage = getWord8 >>= \ty ->
             <*> getPixelFormat
         2 -> SetEncodings
             <$  skip 1
-            <*> (fromIntegral
-                <$> getWord16be
+            <*> (getWord16be
+                <&> fromIntegral
                 >>= flip replicateM getKnownEncoding
                 <&> catMaybes)
         3 -> FramebufferUpdateRequest
@@ -341,8 +346,8 @@ getClientMessage = getWord8 >>= \ty ->
             <*> getWord16be
         6 -> ClientCutText
             <$  skip 3
-            <*> (fromIntegral
-                <$> getWord32be
+            <*> (getWord32be
+                <&> fromIntegral
                 >>= getByteString)
         _ -> fail "unknown message type"
 
