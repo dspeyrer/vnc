@@ -10,7 +10,8 @@ executable vnc
     main-is:          Main.hs
     hs-source-dirs:   src
     other-modules:
-        DES
+        DES,
+        Windows
 
     default-language: GHC2021
     ghc-options:      -Wall
@@ -19,4 +20,5 @@ executable vnc
         network >=3.2.8 && <3.3,
         bytestring,
         binary,
-        random
+        random,
+        Win32

@@ -17,31 +17,43 @@ import Data.String
 import Network.Socket
 import Network.Socket.ByteString.Lazy as N
 import System.Random
+import Windows
 
-data Client = Client
-    { clientSocket :: Socket
-    , clientStream :: LazyByteString
+data ClientCtx = ClientCtx
+    { interface :: Interface
+    , clientSocket :: Socket
     }
 
-newtype Proto a = Proto { runProto :: Client -> IO (Either String a, Client) }
+data ClientState = ClientState
+    { clientStream :: LazyByteString
+    }
+
+newtype Proto a = Proto
+    { runProto :: ClientCtx
+               -> ClientState
+               -> IO (Either String a, ClientState)
+    }
 
 instance Functor Proto where
     fmap = (<*>) . pure
 
 instance Applicative Proto where
     mf <*> mx = mf >>= \f -> mx >>= \x -> return $ f x
-    pure x = Proto $ pure . (pure x,)
+    pure x = Proto $ const $ pure . (pure x,)
 
 instance Monad Proto where
-    m1 >>= m2 = Proto $ \c -> runProto m1 c >>= b'
-        where b' ( Right x, c') = runProto (m2 x) c'
-              b' (Left err, c') = return (Left err, c')
+    m1 >>= m2 = Proto $ \i c -> runProto m1 i c >>= b' i
+        where b' i (Right  x, c') = runProto (m2 x) i c'
+              b' _ (Left err, c') = return (Left err, c')
+
+getInterface :: Proto Interface
+getInterface = Proto $ \c s -> return (Right $ interface c, s)
 
 instance MonadIO Proto where
-    liftIO m = Proto $ \c -> m >>= \x -> return (return x, c)
+    liftIO m = Proto $ \_ s -> m >>= \x -> return (return x, s)
 
 instance MonadFail Proto where
-    fail err = Proto $ \c -> return (Left err, c)
+    fail err = Proto $ \_ s -> return (Left err, s)
 
 class Liftable m where
     lift :: m a -> Proto a
@@ -49,42 +61,47 @@ class Liftable m where
 instance Liftable IO where
     lift = liftIO 
 
+-- Should probably be written in terms of setState
 instance Liftable Get where
-    lift m = join $ Proto $ \c ->
-        let (stream, res) = case runGetOrFail m (clientStream c) of
+    lift m = join $ Proto $ \_ s ->
+        let (stream, res) = case runGetOrFail m (clientStream s) of
                 Left  (rest, _, e) -> (rest,  Left e)
                 Right (rest, _, x) -> (rest, Right x)
-        in return (return $ either fail return res, c { clientStream = stream })
+        in return (return $ either fail return res, s { clientStream = stream })
 
 instance Liftable PutM where
-    lift m = Proto $ \c -> do
+    lift m = Proto $ \c s -> do
             sendAll (clientSocket c) d
-            return (Right x, c)
+            return (Right x, s)
         where (x, d) = runPutM m
 
 main :: IO ()
 main = do
     server <- socket AF_INET Stream defaultProtocol
     setSocketOption server ReuseAddr 1
-    bind server $ SockAddrInet 5900 $ tupleToHostAddress (127, 0, 0, 1)
+    bind server $ SockAddrInet 5900 $ tupleToHostAddress (0, 0, 0, 0)
     listen server 1024
     putStrLn "Listening..."
-    handleClients server
+    interface <- createInterface
+    handleClients interface server
 
-handleClients :: Socket -> IO ()
-handleClients server = do
+handleClients :: Interface -> Socket -> IO ()
+handleClients interface server = do
     (msg, exception) <- handle
         (\(e :: SomeException) -> return (displayException e, Just e))
         $ bracket (accept server) (close . fst) $ \(sock, addr) -> do
             putStrLn $ "Connected to " ++ show addr
             stream <- N.getContents sock
-            (result, _) <- runProto handleClient $ Client sock stream
+            (result, _) <- runProto handleClient
+                (ClientCtx interface sock)
+                (ClientState stream)
             close sock
             return (either id id result, Nothing)
     putStrLn $ "Disconnected -- " ++ msg
     if elem UserInterrupt $ exception >>= fromException
         then return ()
-        else handleClients server
+        else handleClients interface server
+
 
 handleClient :: Proto a
 handleClient = protoVersion
@@ -173,10 +190,10 @@ protoClientInit = do
 
 -- ServerInit -----------------------
 
-putServerInitMsg :: String -> PixelFormat -> Put
-putServerInitMsg name pf = do
-    putWord16be 1080 -- framebuffer-width
-    putWord16be  720 -- framebuffer-height
+putServerInitMsg :: Word16 -> Word16 -> String -> PixelFormat -> Put
+putServerInitMsg w h name pf = do
+    putWord16be w
+    putWord16be h
     putPixelFormat pf
     putWord32be      $
         fromIntegral $
@@ -185,7 +202,10 @@ putServerInitMsg name pf = do
 
 protoServerInit :: Proto a
 protoServerInit = do
-    lift $ putServerInitMsg "headless" $ pixelFormat state
+    i <- getInterface
+    let w = fromIntegral $ capW i
+        h = fromIntegral $ capH i
+    lift $ putServerInitMsg w h "surface" $ pixelFormat state
     protoLoop state
     where state = ServerState defaultPixelFormat
 
@@ -208,25 +228,33 @@ protoLoop state = lift getClientMessage >>= \msg -> do
     case msg of
         SetPixelFormat pixelFormat ->
             protoLoop state { pixelFormat }
-        FramebufferUpdateRequest _incremental x y w h -> do
-            noise <- getStdRandom $ uniformByteString $ div (fromIntegral w * fromIntegral h * (fromIntegral $ bpp $ pixelFormat state)) 8
+        FramebufferUpdateRequest _ _ _ _ _ -> do
+            i <- getInterface
+
+            let w = fromIntegral $ capW i
+                h = fromIntegral $ capH i
+
+            img <- lift $ capture i
+
             lift $ do
-                putWord8 0
-                putWord8 0
-                putWord16be 1
+                putWord8    0 -- ty
+                putWord8    0 -- padding
+                putWord16be 1 -- # rectangles
 
-                putWord16be x
-                putWord16be y
-                putWord16be w
-                putWord16be h
-                putInt32be 0
+                putWord16be 0 -- x
+                putWord16be 0 -- y
+                putWord16be w -- w
+                putWord16be h -- h
+                putInt32be  0 -- encoding
 
-                putByteString noise
+                putByteString img
+
             protoLoop state
         _ -> do
             lift $ putStrLn $ "Unhandled " ++ show msg
             protoLoop state
 
+-- Maybe this should be lifted to the Proto monad?
 data ServerState = ServerState
     { pixelFormat :: PixelFormat
     }
@@ -326,8 +354,8 @@ getClientMessage = getWord8 >>= \ty ->
             <*> getPixelFormat
         2 -> SetEncodings
             <$  skip 1
-            <*> (getWord16be
-                <&> fromIntegral
+            <*> (fromIntegral
+                <$> getWord16be
                 >>= flip replicateM getKnownEncoding
                 <&> catMaybes)
         3 -> FramebufferUpdateRequest
@@ -346,8 +374,8 @@ getClientMessage = getWord8 >>= \ty ->
             <*> getWord16be
         6 -> ClientCutText
             <$  skip 3
-            <*> (getWord32be
-                <&> fromIntegral
+            <*> (fromIntegral
+                <$> getWord32be
                 >>= getByteString)
         _ -> fail "unknown message type"
 
